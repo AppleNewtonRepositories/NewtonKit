@@ -2,29 +2,78 @@
 
 import Foundation
 import NewtonKit
+import NewtonDock
+import NSOF
+import NewtonTranslators
+import Html
+import HtmlPrettyPrint
 
 
-class CommandPrompt {
+final class CommandPrompt {
 
     private enum State {
         case idle
         case initiatingKeyboardPassthrough
         case keyboardPassthrough
+        case initiatingBackup
+        case backingUp
+        case gettingInfo
+        case loadingPackage
     }
 
     private enum Command: String {
         case keyboard
+        case backup
+        case info
+        case load
     }
 
+    private static func documentsDirectory() throws -> URL {
+        #if os(macOS) || os(iOS)
+        return try FileManager.default.url(for: .documentDirectory,
+                                           in: .userDomainMask,
+                                           appropriateFor: nil,
+                                           create: true)
+        #elseif os(Linux) || os(FreeBSD)
+        if let xdgDocumentsDir = ProcessInfo.processInfo.environment["XDG_DOCUMENTS_DIR"] {
+            return URL(fileURLWithPath: xdgDocumentsDir)
+        }
+
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Documents")
+        #endif
+    }
+
+    private static func defaultBackupPath() throws -> String {
+        var documentsDirectory = try self.documentsDirectory()
+        documentsDirectory.appendPathComponent("Newton", isDirectory: true)
+        documentsDirectory.appendPathComponent("Backups", isDirectory: true)
+        print(documentsDirectory.path)
+        return documentsDirectory.path
+    }
 
     private(set) var started = false
 
     private var state: State = .idle
 
     private let dockConnectionLayer: DockConnectionLayer
+    private let backupPath: String
 
-    init(dockConnectionLayer: DockConnectionLayer) {
+    init(dockConnectionLayer: DockConnectionLayer,
+         backupPath: String? = nil) throws {
+
         self.dockConnectionLayer = dockConnectionLayer
+        self.backupPath = try backupPath ?? CommandPrompt.defaultBackupPath()
+        try createDirectory(path: self.backupPath)
+        dockConnectionLayer.backupLayer.onEntry = handleBackupEntry
+        dockConnectionLayer.onCallResult = onCallResult
+        dockConnectionLayer.packageLayer.onResult = onPackageLoadingResult
+    }
+
+    private func createDirectory(path: String) throws {
+        try FileManager.default.createDirectory(atPath: path,
+                                                withIntermediateDirectories: true,
+                                                attributes: nil)
     }
 
     private func prompt() -> String? {
@@ -49,7 +98,54 @@ class CommandPrompt {
             return
         }
 
-        try dockConnectionLayer.sendKeyboardString(line)
+        try dockConnectionLayer.keyboardPassthroughLayer.sendString(line)
+    }
+
+    private func stopKeyboardPassthrough() throws {
+        try dockConnectionLayer.keyboardPassthroughLayer.stop()
+    }
+
+    private func startBackup() throws {
+        let dockState = dockConnectionLayer.state
+        guard dockState == .connected else {
+            print("Can't connect in dock connection state: \(dockState)")
+            return
+        }
+
+        state = .initiatingBackup
+        try dockConnectionLayer.startBackup()
+    }
+
+    private func getInfo() throws {
+        let dockState = dockConnectionLayer.state
+        guard dockState == .connected else {
+            print("Can't connect in dock connection state: \(dockState)")
+            return
+        }
+
+        state = .gettingInfo
+        try dockConnectionLayer.callGlobalFunction(name: "Gestalt", arguments: [
+            0x1000003 as NewtonInteger
+        ])
+    }
+
+    private func loadPackage(atPath path: String) throws {
+        let dockState = dockConnectionLayer.state
+        guard dockState == .connected else {
+            print("Can't connect in dock connection state: \(dockState)")
+            return
+        }
+
+        guard let data = FileManager.default.contents(atPath: path) else {
+            print("Can't load package at path: \(path)")
+            return
+        }
+
+        state = .loadingPackage
+
+        print("Package info: \(try NewtonPackageInfo(data: data))")
+
+        try dockConnectionLayer.loadPackage(data: data)
     }
 
     func handleDockConnectionState(state: DockConnectionLayer.State) {
@@ -69,7 +165,23 @@ class CommandPrompt {
                 print("stopped keyboard passthrough\n")
                 self.state = .idle
             }
-        default:
+        case .initiatingBackup:
+            if state == .backingUp {
+                print("backup started\n")
+                self.state = .backingUp
+            }
+        case .backingUp:
+            if state == .connected {
+                print("backup finished\n")
+                self.state = .idle
+            }
+        case .gettingInfo:
+            break
+        case .loadingPackage:
+            if state == .connected {
+                print("package loading stopped")
+                self.state = .idle
+            }
             break
         }
     }
@@ -83,15 +195,30 @@ class CommandPrompt {
 
             switch state {
             case .idle:
-                if let command = Command(rawValue: line) {
+                let parts = line.split(separator: " ", maxSplits: 1)
+
+                if let firstPart = parts.first,
+                    let command = Command(rawValue: String(firstPart)) {
+
                     switch command {
                     case .keyboard:
                         try startKeyboardPassthrough()
+                    case .backup:
+                        try startBackup()
+                    case .info:
+                        try getInfo()
+                    case .load:
+                        guard parts.count > 1 else {
+                            print("Missing path")
+                            break
+                        }
+                        let path = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        try loadPackage(atPath: path)
                     }
                 }
             case .keyboardPassthrough:
                 if line == ".stop" {
-                    try dockConnectionLayer.stopKeyboardPassthrough()
+                    try stopKeyboardPassthrough()
                 } else {
                     try sendKeyboardString(line)
                 }
@@ -99,5 +226,52 @@ class CommandPrompt {
                 continue
             }
         }
+    }
+
+    private func backupFileURL(application: String, filename: String) throws -> URL {
+        let applicationURL = URL(fileURLWithPath: backupPath)
+            .appendingPathComponent(application, isDirectory: true)
+        try createDirectory(path: applicationURL.path)
+        return applicationURL.appendingPathComponent(filename)
+    }
+
+    private func handleBackupEntry(entry: NewtonFrame) throws {
+        guard let uniqueID = (entry["_uniqueID"] as? NewtonInteger)
+            .map({ String($0.integer) })
+        else {
+            print("Skipping entry without unique ID")
+            return
+        }
+
+        if case "paperroll" as NewtonSymbol = entry["viewStationery"] {
+            let document = translateToHTMLDocument(paperroll: entry)
+            let html = prettyPrint(document)
+            let url = try backupFileURL(application: "Notes", filename: "\(uniqueID).html")
+            try html.write(to: url, atomically: true, encoding: .utf8)
+        } else if case "meeting" as NewtonSymbol = entry["viewStationery"] {
+            // TODO: translateToEvent(meeting: entry)
+        } else {
+            print("Unsupported soup entry:", entry)
+        }
+    }
+
+    private func onCallResult(result: NewtonObject) {
+        switch state {
+        case .gettingInfo:
+            print("Info:\n\(result)\n")
+        default:
+            print("Unexpected call result: \(result)")
+        }
+
+        state = .idle
+    }
+
+    private func onPackageLoadingResult(successful: Bool) {
+        if successful {
+            print("package loading finished")
+        } else {
+            print("package loading failed")
+        }
+        state = .idle
     }
 }
